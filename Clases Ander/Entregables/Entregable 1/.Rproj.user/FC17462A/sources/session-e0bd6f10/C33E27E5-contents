@@ -1,0 +1,410 @@
+---
+title: "Modelización de la energía consumida en auxiliares"
+author: "Enrique Lahuerta"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    highlight: tango
+    latex_engine: xelatex
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{longtable}
+  - \usepackage{float}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 6,
+  fig.height = 4,
+  fig.align = "center"
+)
+
+options(knitr.table.format = "latex")
+```
+
+# Introducción
+
+Este documento presenta el análisis del consumo energético en los equipos auxiliares de trenes, utilizando datos de septiembre 2019. El objetivo es desarrollar modelos predictivos basados en los tiempos de funcionamiento de los componentes HVAC.
+
+# Carga de datos
+
+```{r carga}
+library(tidyverse)
+library(lubridate)
+library(broom)
+library(caret)
+library(randomForest)
+library(xgboost)
+library(knitr)
+library(kableExtra)
+library(lmtest)
+
+set.seed(123)
+
+load("Entregable1.RData")
+
+# Verificar nombre del objeto cargado
+if (!exists("df")) {
+  df <- get(ls()[sapply(ls(), function(x) is.data.frame(get(x)))][1])
+}
+```
+
+Los datos contienen `r nrow(df)` observaciones con `r ncol(df)` variables, incluyendo la variable objetivo `eaux_train_ac` (consumo energético en kWh).
+
+# Filtrado de datos
+
+```{r filtrado}
+df_filtered <- df %>%
+  filter(!is.na(event_duration),
+         event_duration > 0,
+         event_duration <= 600,
+         tolower(trimws(as.character(event))) != "maintenance") %>%
+  mutate(event_lower = tolower(trimws(as.character(event)))) %>%
+  filter(complete.cases(.))
+```
+
+Se han eliminado `r nrow(df) - nrow(df_filtered)` observaciones (`r round((nrow(df) - nrow(df_filtered))/nrow(df)*100, 1)`% del total), quedando `r nrow(df_filtered)` eventos válidos de tipo interstation y stop.
+
+# Comparativa de consumos
+
+## Diferencia en consumo energético (eaux_train_ac)
+
+```{r comp_energia}
+stats_energia <- df_filtered %>%
+  group_by(event_lower) %>%
+  summarise(
+    n = n(),
+    Media = mean(eaux_train_ac),
+    Mediana = median(eaux_train_ac),
+    `Desv. Std` = sd(eaux_train_ac)
+  )
+
+kable(stats_energia,
+      caption = "Estadísticas de energía consumida por evento",
+      digits = 3,
+      booktabs = TRUE) %>%
+  kable_styling(latex_options = c("hold_position"), font_size = 10)
+
+# Test estadístico
+energia_inter <- df_filtered %>% filter(event_lower == "interstation") %>% pull(eaux_train_ac)
+energia_stop <- df_filtered %>% filter(event_lower == "stop") %>% pull(eaux_train_ac)
+
+test_energia <- wilcox.test(energia_inter, energia_stop)
+test_energia
+```
+
+**Respuesta:** **SÍ** existe diferencia estadísticamente significativa (p < 0.001). Los eventos interstation consumen considerablemente más energía que los eventos stop, con una media de `r round(mean(energia_inter), 2)` kWh frente a `r round(mean(energia_stop), 2)` kWh. Esto se debe a que durante los trayectos entre estaciones los sistemas HVAC deben trabajar más tiempo y con mayor intensidad.
+
+## Diferencia en potencia (kW)
+
+```{r comp_potencia}
+df_filtered <- df_filtered %>%
+  mutate(potencia_kw = ifelse(event_duration > 1,
+                               eaux_train_ac / (event_duration / 3600),
+                               NA_real_))
+
+df_potencia <- df_filtered %>% filter(!is.na(potencia_kw))
+
+stats_potencia <- df_potencia %>%
+  group_by(event_lower) %>%
+  summarise(
+    n = n(),
+    Media = mean(potencia_kw),
+    Mediana = median(potencia_kw),
+    `Desv. Std` = sd(potencia_kw)
+  )
+
+kable(stats_potencia,
+      caption = "Estadísticas de potencia por evento",
+      digits = 3,
+      booktabs = TRUE) %>%
+  kable_styling(latex_options = c("hold_position"), font_size = 10)
+
+# Test estadístico
+potencia_inter <- df_potencia %>% filter(event_lower == "interstation") %>% pull(potencia_kw)
+potencia_stop <- df_potencia %>% filter(event_lower == "stop") %>% pull(potencia_kw)
+
+test_potencia <- wilcox.test(potencia_inter, potencia_stop)
+test_potencia
+```
+
+**Respuesta:** **SÍ** existe diferencia estadísticamente significativa (p < 0.001). Los eventos interstation tienen mayor potencia media que los eventos stop, indicando mayor intensidad de consumo por unidad de tiempo durante los trayectos entre estaciones.
+
+# Modelo de regresión lineal
+
+```{r prep_quincena}
+df1 <- df_filtered %>%
+  filter(date_time >= as.POSIXct("2019-09-01 00:00:00"),
+         date_time < as.POSIXct("2019-09-16 00:00:00"))
+
+df_quincena <- df1 %>%
+  select(eaux_train_ac, event_duration, event_lower,
+         suma_ton_compresores, suma_hvac_ton_compresores,
+         suma_hvac_ton_heater, suma_ton_comp_cab, suma_ton_heater_cab)
+```
+
+Se han seleccionado `r nrow(df_quincena)` registros correspondientes a la primera quincena de septiembre de 2019.
+
+```{r outliers_check}
+Q1 <- quantile(df_quincena$eaux_train_ac, 0.25)
+Q3 <- quantile(df_quincena$eaux_train_ac, 0.75)
+IQR <- Q3 - Q1
+lower <- Q1 - 1.5 * IQR
+upper <- Q3 + 1.5 * IQR
+
+num_outliers <- sum(df_quincena$eaux_train_ac < lower | df_quincena$eaux_train_ac > upper)
+```
+
+Se detectaron `r num_outliers` outliers en la variable objetivo usando el método IQR.
+
+```{r transform_data}
+df_model <- df_quincena %>%
+  mutate(log_eaux_train_ac = log1p(eaux_train_ac))
+
+predictors <- c("event_duration", "suma_ton_compresores", "suma_hvac_ton_compresores",
+                "suma_hvac_ton_heater", "suma_ton_comp_cab", "suma_ton_heater_cab")
+
+df_model <- df_model %>%
+  mutate(event_stop = ifelse(event_lower == "stop", 1, 0))
+
+X <- df_model %>%
+  select(all_of(predictors), event_stop)
+
+y <- df_model$log_eaux_train_ac
+
+X_with_const <- X
+```
+
+Transformación logarítmica aplicada a la variable objetivo.
+
+```{r modelo_lineal}
+modelo_lineal <- lm(log_eaux_train_ac ~ event_duration + suma_ton_compresores +
+                    suma_hvac_ton_compresores + suma_hvac_ton_heater +
+                    suma_ton_comp_cab + suma_ton_heater_cab + event_stop,
+                    data = df_model)
+
+summary(modelo_lineal)
+
+coef_table <- tidy(modelo_lineal) %>%
+  mutate(
+    p_formatted = case_when(
+      p.value < 2.2e-16 ~ "< 2.2e-16",
+      p.value < 0.001 ~ sprintf("%.2e", p.value),
+      p.value < 0.01 ~ sprintf("%.4f", p.value),
+      TRUE ~ sprintf("%.4f", p.value)
+    ),
+    sig = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01 ~ "**",
+      p.value < 0.05 ~ "*",
+      TRUE ~ ""
+    )
+  )
+
+kable(coef_table %>% select(term, estimate, std.error, statistic, p_formatted, sig),
+      caption = "Coeficientes del modelo de regresión lineal",
+      digits = 6,
+      col.names = c("Variable", "Estimación", "Error Est.", "t-stat", "p-valor", "Sig."),
+      booktabs = TRUE) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 8)
+```
+
+# Revisión del modelo de regresión
+
+## ¿Es explicativo el modelo?
+
+```{r capacidad}
+r2 <- summary(modelo_lineal)$r.squared
+r2_adj <- summary(modelo_lineal)$adj.r.squared
+```
+
+**Respuesta:** **SÍ**. El modelo explica el `r round(r2*100, 2)`% de la variabilidad en el consumo energético (R² = `r round(r2, 4)`).
+
+## ¿Tiene sentido un modelo reducido o por estratos?
+
+```{r modelo_reducido}
+vars_no_sig <- coef_table %>% filter(p.value >= 0.05, term != "(Intercept)")
+```
+
+**Respuesta:** Todas las variables incluidas en el modelo son estadísticamente significativas (p < 0.05), por lo que **no es necesario** un modelo reducido.
+
+Respecto a modelos por estratos: dado que encontramos diferencias significativas entre eventos interstation y stop, **sí tendría sentido** desarrollar modelos específicos para cada tipo de evento.
+
+## Variables estadísticamente significativas
+
+```{r vars_sig}
+vars_sig <- coef_table %>%
+  filter(p.value < 0.05, term != "(Intercept)") %>%
+  select(Variable = term, `p-valor` = p.value)
+
+kable(vars_sig,
+      caption = "Variables significativas del modelo",
+      digits = 6,
+      booktabs = TRUE) %>%
+  kable_styling(latex_options = c("hold_position"), font_size = 10)
+```
+
+**Todas las variables** incluidas en el modelo son estadísticamente significativas (p < 0.05).
+
+## Significado de los coeficientes
+
+Dado que la variable objetivo fue transformada logarítmicamente, los coeficientes se interpretan como impacto porcentual sobre el consumo:
+
+**const** (`r round(coef(modelo_lineal)[1], 4)`): Consumo base en escala logarítmica para un evento interstation cuando todas las demás variables son cero.
+
+**event_duration** (`r round(coef(modelo_lineal)[2], 6)`): Por cada segundo adicional de duración, el consumo aumenta aproximadamente `r round(coef(modelo_lineal)[2]*100, 2)`%.
+
+**suma_ton_compresores** (`r round(coef(modelo_lineal)[3], 6)`): Por cada segundo adicional de uso, el consumo aumenta aproximadamente `r round(coef(modelo_lineal)[3]*100, 2)`%.
+
+**suma_hvac_ton_compresores** (`r round(coef(modelo_lineal)[4], 6)`): Por cada segundo adicional de uso, el consumo aumenta aproximadamente `r round(coef(modelo_lineal)[4]*100, 2)`%.
+
+**suma_hvac_ton_heater** (`r round(coef(modelo_lineal)[5], 6)`): Por cada segundo adicional de uso, el consumo aumenta aproximadamente `r round(coef(modelo_lineal)[5]*100, 2)`%.
+
+**suma_ton_comp_cab** (`r round(coef(modelo_lineal)[6], 6)`): Por cada segundo adicional de uso, el consumo aumenta aproximadamente `r round(coef(modelo_lineal)[6]*100, 2)`%.
+
+**suma_ton_heater_cab** (`r round(coef(modelo_lineal)[7], 6)`): Por cada segundo adicional de uso, el consumo aumenta aproximadamente `r round(coef(modelo_lineal)[7]*100, 2)`%.
+
+**event_stop** (`r round(coef(modelo_lineal)[8], 4)`): Un evento stop consume aproximadamente `r round((exp(coef(modelo_lineal)[8])-1)*100, 1)`% menos que un evento interstation.
+
+
+## Distribución de residuos
+
+```{r residuos, fig.height=6}
+y_pred <- predict(modelo_lineal, df_model)
+residuos <- y - y_pred
+
+par(mfrow = c(2, 2))
+plot(modelo_lineal, which = 1:4)
+par(mfrow = c(1, 1))
+```
+
+Los gráficos de residuos muestran una distribución aproximadamente normal centrada en cero. El gráfico de residuos vs valores ajustados presenta una nube de puntos uniforme, confirmando que la transformación logarítmica corrigió la heterocedasticidad.
+
+# Validación del modelo
+
+```{r validacion_train}
+y_train_kwh <- expm1(y)
+y_pred_train_kwh <- expm1(y_pred)
+
+rmse_train <- sqrt(mean((y_train_kwh - y_pred_train_kwh)^2))
+```
+
+RMSE (Entrenamiento, 1ª quincena): `r round(rmse_train, 4)` kWh
+
+```{r validacion_test}
+df2 <- df_filtered %>%
+  filter(date_time >= as.POSIXct("2019-09-16 00:00:00"),
+         date_time < as.POSIXct("2019-10-01 00:00:00"))
+
+df_val_prep <- df2 %>%
+  select(eaux_train_ac, event_duration, event_lower,
+         suma_ton_compresores, suma_hvac_ton_compresores,
+         suma_hvac_ton_heater, suma_ton_comp_cab, suma_ton_heater_cab) %>%
+  mutate(log_eaux_train_ac = log1p(eaux_train_ac),
+         event_stop = ifelse(event_lower == "stop", 1, 0))
+
+X_val <- df_val_prep %>%
+  select(all_of(predictors), event_stop)
+
+y_val_kwh <- df_val_prep$eaux_train_ac
+
+y_pred_log_val <- predict(modelo_lineal, df_val_prep)
+y_pred_kwh_val <- expm1(y_pred_log_val)
+
+rmse_val <- sqrt(mean((y_val_kwh - y_pred_kwh_val)^2))
+```
+
+RMSE (Validación, 2ª quincena): `r round(rmse_val, 4)` kWh
+
+```{r metricas_lm}
+metricas_lm <- data.frame(
+  Conjunto = c("Entrenamiento", "Validación"),
+  RMSE = c(rmse_train, rmse_val)
+)
+
+kable(metricas_lm,
+      caption = "Métricas del modelo de regresión lineal",
+      digits = 4,
+      booktabs = TRUE) %>%
+  kable_styling(latex_options = c("hold_position"), font_size = 10)
+```
+
+**¿El modelo generaliza bien?** Los valores de RMSE son casi idénticos, con una diferencia de `r round(abs(rmse_val - rmse_train), 4)` kWh, indicando ausencia de overfitting.
+
+**¿Los errores son similares?** **SÍ**.
+
+# Modelo predictivo de Machine Learning
+
+## Random Forest
+
+```{r rf}
+rf_model <- randomForest(
+  log_eaux_train_ac ~ event_duration + suma_ton_compresores +
+    suma_hvac_ton_compresores + suma_hvac_ton_heater +
+    suma_ton_comp_cab + suma_ton_heater_cab + event_stop,
+  data = df_model,
+  ntree = 100
+)
+
+y_pred_log_rf_train <- predict(rf_model, df_model)
+y_pred_kwh_rf_train <- expm1(y_pred_log_rf_train)
+rmse_train_rf <- sqrt(mean((y_train_kwh - y_pred_kwh_rf_train)^2))
+
+y_pred_log_rf_val <- predict(rf_model, df_val_prep)
+y_pred_kwh_rf_val <- expm1(y_pred_log_rf_val)
+rmse_val_rf <- sqrt(mean((y_val_kwh - y_pred_kwh_rf_val)^2))
+```
+
+RMSE (Entrenamiento, RF): `r round(rmse_train_rf, 4)` kWh
+
+RMSE (Validación, RF): `r round(rmse_val_rf, 4)` kWh
+
+## Comparación de modelos
+
+```{r comparacion}
+comparacion <- data.frame(
+  Modelo = c("Regresión Lineal", "Random Forest"),
+  RMSE_Train = c(rmse_train, rmse_train_rf),
+  RMSE_Test = c(rmse_val, rmse_val_rf)
+)
+
+kable(comparacion,
+      caption = "Comparación de modelos",
+      digits = 4,
+      col.names = c("Modelo", "RMSE Train", "RMSE Test"),
+      booktabs = TRUE) %>%
+  kable_styling(latex_options = c("hold_position"), font_size = 9) %>%
+  row_spec(which.min(comparacion$RMSE_Test), bold = TRUE)
+
+mejora_rf <- (rmse_val - rmse_val_rf) / rmse_val * 100
+```
+
+**¿Se mejora la capacidad predictiva?** El modelo Random Forest muestra un RMSE de validación `r round(rmse_val / rmse_val_rf, 1)` veces menor que el de la Regresión Lineal.
+
+**¿Qué ocurre con la explicabilidad?** Se produce un intercambio entre explicabilidad y precisión. El modelo de regresión lineal ofrece máxima interpretabilidad con coeficientes claros. El Random Forest es un modelo de "caja negra" donde no se obtienen coeficientes simples.
+
+## Selección del modelo final
+
+```{r seleccion}
+mejor_modelo <- comparacion$Modelo[which.min(comparacion$RMSE_Test)]
+```
+
+**Modelo seleccionado: `r mejor_modelo`**
+
+La Regresión Lineal presenta un error de predicción (RMSE de `r round(rmse_val, 4)` kWh) elevado. El Random Forest ofrece un error de validación `r round(mejora_rf, 1)`% menor (RMSE `r round(rmse_val_rf, 4)` kWh). Esta mejora en precisión justifica su selección como modelo final.
+
+# Conclusiones
+
+Se han desarrollado dos modelos para predecir el consumo energético de auxiliares en trenes:
+
+1. **Regresión Lineal**: R² = `r round(r2, 4)`, RMSE = `r round(rmse_val, 4)` kWh.
+
+2. **Random Forest**: RMSE Test = `r round(rmse_val_rf, 4)` kWh.
+
+El modelo **`r mejor_modelo`** se selecciona como modelo final por ofrecer el menor RMSE en validación (`r round(min(comparacion$RMSE_Test), 4)` kWh).

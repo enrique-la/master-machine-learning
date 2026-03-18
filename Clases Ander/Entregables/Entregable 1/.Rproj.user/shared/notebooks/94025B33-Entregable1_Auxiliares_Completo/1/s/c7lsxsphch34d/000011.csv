@@ -1,0 +1,8 @@
+"0","kable(coef_table %>% select(term, estimate, std.error, statistic, p_formatted, sig),
+      caption = ""Coeficientes del modelo de regresión lineal"",
+      digits = 6,
+      col.names = c(""Variable"", ""Estimación"", ""Error Est."", ""t-stat"", ""p-valor"", ""Sig.""),
+      booktabs = TRUE) %>%
+  kable_styling(latex_options = c(""hold_position"", ""scale_down""), font_size = 8)
+"
+"0",""

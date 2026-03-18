@@ -1,0 +1,38 @@
+### Paquetes de R necesarios para las Prácticas
+
+##Instalación de paquetes de R (ejecutar únicamente la primera vez)
+
+#bit64
+install.packages("bit64")
+#scales
+install.packages("scales")
+#ROCR
+install.packages("ROCR")
+#glmnet
+install.packages("glmnet")
+#randomForest
+install.packages("randomForest")
+#xgboost
+install.packages('xgboost')
+#multcomp
+install.packages("multcomp")
+#xts
+install.packages("xts")
+#tseries
+install.packages("tseries")
+#fTrading
+install.packages("fTrading")
+
+
+##Cargar librerías de R necesarias (previamente deben ser instaladas)
+
+library(bit64)
+library(scales)
+library(ROCR)
+library(glmnet)
+library(randomForest)
+library(xgboost)
+library(multcomp)
+library(xts)
+library(tseries)
+library(fTrading)
